@@ -1,5 +1,7 @@
 """Memory backends for pluggable file storage."""
 
+import contextlib
+
 from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.context_hub import ContextHubBackend
 from deepagents.backends.filesystem import FilesystemBackend
@@ -26,3 +28,8 @@ __all__ = [
     "StateBackend",
     "StoreBackend",
 ]
+
+with contextlib.suppress(ImportError):
+    from deepagents.backends.oss_backend import OSSBackend
+
+    __all__ += ["OSSBackend"]
