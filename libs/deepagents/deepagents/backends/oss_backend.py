@@ -41,9 +41,9 @@ logger = logging.getLogger(__name__)
 class OSSBackend(BackendProtocol):
     """Backend that stores files in Alibaba Cloud OSS.
 
-    Maps virtual paths (e.g. ``/file.txt``) to OSS object keys
-    (e.g. ``prefix/file.txt``).  File content is persisted as
-    JSON-serialized ``FileData`` objects.
+    Maps virtual paths (e.g. `/file.txt`) to OSS object keys
+    (e.g. `prefix/file.txt`).  File content is persisted as
+    JSON-serialized `FileData` objects.
 
     Example::
 
@@ -69,11 +69,11 @@ class OSSBackend(BackendProtocol):
         """Initialize OSSBackend.
 
         Args:
-            endpoint: OSS endpoint URL (e.g. ``https://oss-cn-hangzhou.aliyuncs.com``).
+            endpoint: OSS endpoint URL (e.g. `https://oss-cn-hangzhou.aliyuncs.com`).
             access_key_id: Alibaba Cloud access key ID.
             access_key_secret: Alibaba Cloud access key secret.
             bucket_name: Name of the OSS bucket.
-            prefix: Optional key prefix for all objects (e.g. ``"agent-files/"``).
+            prefix: Optional key prefix for all objects (e.g. `"agent-files/"`).
         """
         auth = oss2.Auth(access_key_id, access_key_secret)
         self._bucket = oss2.Bucket(auth, endpoint, bucket_name)
@@ -86,7 +86,7 @@ class OSSBackend(BackendProtocol):
     def _to_oss_key(self, virtual_path: str) -> str:
         """Convert a virtual path to an OSS object key.
 
-        Strips the leading ``/`` and prepends the configured prefix.
+        Strips the leading `/` and prepends the configured prefix.
         """
         stripped = virtual_path.lstrip("/")
         return f"{self._prefix}{stripped}"
@@ -103,15 +103,15 @@ class OSSBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     def _put_file_data(self, virtual_path: str, file_data: FileData) -> None:
-        """Serialize *file_data* as JSON and upload to OSS."""
+        """Serialize `file_data` as JSON and upload to OSS."""
         payload = json.dumps(dict(file_data), ensure_ascii=False).encode("utf-8")
         key = self._to_oss_key(virtual_path)
         self._bucket.put_object(key, payload)
 
     def _get_file_data(self, virtual_path: str) -> FileData | None:
-        """Download an object from OSS and deserialize to ``FileData``.
+        """Download an object from OSS and deserialize to `FileData`.
 
-        Returns ``None`` when the object does not exist.
+        Returns `None` when the object does not exist.
         """
         key = self._to_oss_key(virtual_path)
         try:
@@ -130,7 +130,7 @@ class OSSBackend(BackendProtocol):
             return None
 
     def _list_keys(self, prefix: str = "") -> list[str]:
-        """List all object keys under *prefix* (non-recursive listing helper)."""
+        """List all object keys under `prefix` (non-recursive listing helper)."""
         oss_prefix = self._to_oss_key(prefix.lstrip("/")) if prefix else self._prefix
         return [obj.key for obj in oss2.ObjectIterator(self._bucket, prefix=oss_prefix)]
 
@@ -145,7 +145,7 @@ class OSSBackend(BackendProtocol):
             path: Virtual directory path.
 
         Returns:
-            ``LsResult`` with entries.
+            `LsResult` with entries.
         """
         oss_prefix = self._to_oss_key(path.lstrip("/"))
         if oss_prefix and not oss_prefix.endswith("/"):
@@ -189,7 +189,7 @@ class OSSBackend(BackendProtocol):
             limit: Maximum number of lines.
 
         Returns:
-            ``ReadResult`` with file data or error.
+            `ReadResult` with file data or error.
         """
         file_data = self._get_file_data(file_path)
         if file_data is None:
@@ -224,7 +224,7 @@ class OSSBackend(BackendProtocol):
             content: String content to write.
 
         Returns:
-            ``WriteResult`` with path or error.
+            `WriteResult` with path or error.
         """
         existing = self._get_file_data(file_path)
         if existing is not None:
@@ -249,10 +249,10 @@ class OSSBackend(BackendProtocol):
             file_path: Virtual file path.
             old_string: Text to find.
             new_string: Replacement text.
-            replace_all: Replace all occurrences when ``True``.
+            replace_all: Replace all occurrences when `True`.
 
         Returns:
-            ``EditResult`` with path and occurrence count, or error.
+            `EditResult` with path and occurrence count, or error.
         """
         file_data = self._get_file_data(file_path)
         if file_data is None:
@@ -285,7 +285,7 @@ class OSSBackend(BackendProtocol):
             glob: Optional filename glob filter.
 
         Returns:
-            ``GrepResult`` with matches.
+            `GrepResult` with matches.
         """
         files = self._load_all_files(path)
         return grep_matches_from_files(files, pattern, path if path is not None else "/", glob)
@@ -294,11 +294,11 @@ class OSSBackend(BackendProtocol):
         """Find files matching a glob pattern.
 
         Args:
-            pattern: Glob pattern (e.g. ``"*.py"``).
+            pattern: Glob pattern (e.g. `"*.py"`).
             path: Base directory to search from.
 
         Returns:
-            ``GlobResult`` with matching file info.
+            `GlobResult` with matching file info.
         """
         files = self._load_all_files(path)
         result = _glob_search_files(files, pattern, path)
@@ -324,10 +324,10 @@ class OSSBackend(BackendProtocol):
         """Upload multiple files to OSS.
 
         Args:
-            files: List of ``(path, content_bytes)`` tuples.
+            files: List of `(path, content_bytes)` tuples.
 
         Returns:
-            List of ``FileUploadResponse`` objects.
+            List of `FileUploadResponse` objects.
         """
         responses: list[FileUploadResponse] = []
         for path, content in files:
@@ -339,7 +339,11 @@ class OSSBackend(BackendProtocol):
                 encoding = "base64"
 
             existing = self._get_file_data(path)
-            file_data = update_file_data(existing, text) if existing else create_file_data(text, encoding=encoding)
+            file_data = (
+                update_file_data(existing, text)
+                if existing and existing.get("encoding", "utf-8") == encoding
+                else create_file_data(text, encoding=encoding)
+            )
             self._put_file_data(path, file_data)
             responses.append(FileUploadResponse(path=path, error=None))
         return responses
@@ -351,7 +355,7 @@ class OSSBackend(BackendProtocol):
             paths: List of virtual file paths.
 
         Returns:
-            List of ``FileDownloadResponse`` objects.
+            List of `FileDownloadResponse` objects.
         """
         responses: list[FileDownloadResponse] = []
         for path in paths:
@@ -373,9 +377,9 @@ class OSSBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     def _load_all_files(self, path: str | None = None) -> dict[str, Any]:
-        """Load all ``FileData`` objects under *path* into a dict.
+        """Load all `FileData` objects under `path` into a dict.
 
-        Used by ``grep`` and ``glob`` which need in-memory access to file
+        Used by `grep` and `glob` which need in-memory access to file
         contents for pattern matching.
         """
         search_path = path if path is not None else "/"
