@@ -1559,6 +1559,7 @@ def cli_main() -> None:
     """Entry point for console script."""
     # Fix for gRPC fork issue on macOS
     # https://github.com/grpc/grpc/issues/37642
+    # macOS 不允许 gRPC 使用分身，会崩，所以关掉
     if sys.platform == "darwin":
         os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
 
