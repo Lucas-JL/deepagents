@@ -259,9 +259,9 @@ class TestShortFlags:
 
     def test_short_model_flag(self) -> None:
         """Verify -M sets model."""
-        with patch.object(sys, "argv", ["deepagents", "-M", "gpt-4o"]):
+        with patch.object(sys, "argv", ["deepagents", "-M", "gpt-5.5"]):
             args = parse_args()
-        assert args.model == "gpt-4o"
+        assert args.model == "gpt-5.5"
 
     def test_agent_default_value(self) -> None:
         """Verify -a is `None` when omitted so downstream fallback can run.
@@ -371,12 +371,12 @@ class TestNoMcpArg:
 
 
 class TestMcpCommandDispatch:
-    """Tests for `cli_main()` dispatch of `deepagents mcp` subcommands."""
+    """Tests for `cli_main()` dispatch of `dcode mcp` subcommands."""
 
     def test_mcp_login_rejects_global_mcp_config(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """`deepagents mcp login` errors if only top-level `--mcp-config` is set."""
+        """`dcode mcp login` errors if only top-level `--mcp-config` is set."""
         from deepagents_code.main import cli_main
 
         with (

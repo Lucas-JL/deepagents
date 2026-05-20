@@ -25,6 +25,7 @@ from deepagents_code.textual_adapter import (
     _build_interrupted_ai_message,
     _handle_interrupt_cleanup,
     _is_summarization_chunk,
+    _persist_context_tokens,
     execute_task_textual,
     format_token_count,
     print_usage_table,
@@ -223,6 +224,129 @@ class TestInterruptCleanup:
         interrupted_msg = interrupted_payload["messages"][0]
         assert interrupted_msg.tool_calls[0]["id"] == "call-1"
         assert interrupted_msg.tool_calls[0]["name"] == "read_file"
+
+    async def test_disables_tracing_during_state_save(self) -> None:
+        """Interrupt-cleanup `aupdate_state` calls must run with tracing disabled.
+
+        Interrupt state writes (partial AI message + cancellation notice) are
+        internal recovery mechanics. Surfacing them as standalone `UpdateState`
+        runs in LangSmith would add noise unrelated to user-visible agent activity.
+        """
+        from langsmith import get_tracing_context
+
+        captured: list[object] = []
+
+        async def _capture(*_args: object, **_kwargs: object) -> None:  # noqa: RUF029
+            captured.append(get_tracing_context().get("enabled"))
+
+        agent = SimpleNamespace(aupdate_state=AsyncMock(side_effect=_capture))
+        adapter = TextualUIAdapter(
+            mount_message=AsyncMock(),
+            update_status=_noop_status,
+            request_approval=_mock_approval,
+            set_spinner=AsyncMock(),
+            set_active_message=MagicMock(),
+        )
+
+        await _handle_interrupt_cleanup(
+            adapter=adapter,
+            agent=agent,
+            config={"configurable": {"thread_id": "t-1"}},
+            pending_text_by_namespace={},
+            captured_input_tokens=0,
+            captured_output_tokens=0,
+            turn_stats=SessionStats(),
+            start_time=0.0,
+        )
+
+        assert captured, "aupdate_state was never called"
+        assert all(v is False for v in captured), (
+            f"tracing was not disabled: {captured}"
+        )
+
+    async def test_disables_tracing_when_interrupted_msg_present(self) -> None:
+        """Both `aupdate_state` calls disable tracing when interrupted_msg is set.
+
+        When there is a partial AI message to save, both writes (interrupted AI
+        message and cancellation notice) must be suppressed from LangSmith traces.
+        """
+        from langsmith import get_tracing_context
+
+        captured: list[object] = []
+
+        async def _capture(*_args: object, **_kwargs: object) -> None:  # noqa: RUF029
+            captured.append(get_tracing_context().get("enabled"))
+
+        tool_widget = MagicMock()
+        tool_widget._tool_name = "read_file"
+        tool_widget._args = {"path": "notes.txt"}
+
+        agent = SimpleNamespace(aupdate_state=AsyncMock(side_effect=_capture))
+        adapter = TextualUIAdapter(
+            mount_message=AsyncMock(),
+            update_status=_noop_status,
+            request_approval=_mock_approval,
+            set_spinner=AsyncMock(),
+            set_active_message=MagicMock(),
+        )
+        adapter._current_tool_messages = {"call-1": tool_widget}
+
+        await _handle_interrupt_cleanup(
+            adapter=adapter,
+            agent=agent,
+            config={"configurable": {"thread_id": "t-1"}},
+            pending_text_by_namespace={},
+            captured_input_tokens=0,
+            captured_output_tokens=0,
+            turn_stats=SessionStats(),
+            start_time=0.0,
+        )
+
+        assert len(captured) == 2, (
+            f"expected 2 aupdate_state calls, got {len(captured)}"
+        )
+        assert all(v is False for v in captured), (
+            f"tracing was not disabled: {captured}"
+        )
+
+
+class TestPersistContextTokens:
+    """Tests for `_persist_context_tokens`."""
+
+    async def test_skips_aupdate_state_for_remote_agent(self) -> None:
+        """Remote agents must not call aupdate_state for _context_tokens.
+
+        When the agent is a RemoteAgent, aupdate_state goes over HTTP to the
+        dev server, which creates its own LangSmith trace that the client
+        cannot suppress with tracing_context(enabled=False). Skipping the call
+        is safe because persistence is best-effort.
+        """
+        from deepagents_code.remote_client import RemoteAgent
+
+        agent = MagicMock(spec=RemoteAgent)
+        agent.aupdate_state = AsyncMock()
+
+        await _persist_context_tokens(
+            agent, {"configurable": {"thread_id": "t-1"}}, 1234
+        )
+
+        agent.aupdate_state.assert_not_called()
+
+    async def test_calls_aupdate_state_for_local_agent(self) -> None:
+        """Local agents should still call aupdate_state for _context_tokens."""
+        called_with: list[object] = []
+
+        def _capture(*args: object, **_kwargs: object) -> None:
+            called_with.append(args[1])  # the values dict
+
+        agent = SimpleNamespace(aupdate_state=AsyncMock(side_effect=_capture))
+
+        await _persist_context_tokens(
+            agent, {"configurable": {"thread_id": "t-2"}}, 9999
+        )
+
+        assert len(called_with) == 1
+        assert called_with[0] == {"_context_tokens": 9999}
 
 
 class TestBuildStreamConfig:

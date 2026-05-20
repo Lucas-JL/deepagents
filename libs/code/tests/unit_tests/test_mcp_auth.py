@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -14,6 +15,7 @@ from deepagents_code.mcp_auth import (
     FileTokenStorage,
     MCPReauthRequiredError,
     find_reauth_required,
+    format_login_failure,
     resolve_headers,
 )
 
@@ -243,6 +245,68 @@ class TestFindReauthRequired:
         assert find_reauth_required(a) is None
 
 
+class TestFormatLoginFailure:
+    """Tests for the token-safe summary helper used in app + CLI logs."""
+
+    def test_returns_reauth_message_for_nested_reauth_error(self) -> None:
+        """ExceptionGroup wrapping `MCPReauthRequiredError` surfaces its message."""
+        exc = ExceptionGroup(
+            "anyio task group",
+            [RuntimeError("upstream"), MCPReauthRequiredError("notion")],
+        )
+        summary = format_login_failure(exc)
+        assert "notion" in summary
+        assert "Run `/mcp login notion`" in summary
+
+    def test_omits_message_for_unknown_exception_types(self) -> None:
+        """Unrecognized exceptions degrade to a class-name chain — no `str()`.
+
+        Tokens can hide in `args`/`repr` of unfamiliar MCP-SDK error types;
+        the helper must never include those payloads.
+        """
+
+        class FakeMcpError(RuntimeError):
+            pass
+
+        sentinel = "TOKEN_PAYLOAD_DO_NOT_LEAK"
+        exc = FakeMcpError(sentinel)
+        summary = format_login_failure(exc)
+        assert sentinel not in summary
+        assert "FakeMcpError" in summary
+
+    def test_includes_message_for_known_loopback_errors(self) -> None:
+        """Loopback-internal exceptions are token-free and may include their message."""
+        from deepagents_code.mcp_auth import _LoopbackCallbackTimeoutError
+
+        exc = _LoopbackCallbackTimeoutError("Callback timed out")
+        summary = format_login_failure(exc)
+        assert "Callback timed out" in summary
+        assert "_LoopbackCallbackTimeoutError" in summary
+
+    def test_walks_cause_chain_into_class_names(self) -> None:
+        """A chained unknown exception still surfaces every link's class name."""
+
+        class OuterError(RuntimeError):
+            pass
+
+        class InnerError(RuntimeError):
+            pass
+
+        inner_msg = "inner-payload"
+        outer_msg = "outer-payload"
+        try:
+            try:
+                raise InnerError(inner_msg)  # noqa: TRY301
+            except InnerError as inner:
+                raise OuterError(outer_msg) from inner
+        except OuterError as exc:
+            summary = format_login_failure(exc)
+        assert "OuterError" in summary
+        assert "InnerError" in summary
+        assert inner_msg not in summary
+        assert outer_msg not in summary
+
+
 class TestAppendQueryParams:
     """Tests for `_append_query_params` URL manipulation."""
 
@@ -329,9 +393,21 @@ class TestBuildOAuthProvider:
         assert _is_slack_mcp_url("https://deep.slack.com/mcp")
         assert not _is_slack_mcp_url("https://mcp.notion.com/mcp")
 
+    def test_slack_provider_uses_fixed_loopback_port(self) -> None:
+        """SlackProvider uses a fixed port matching the Slack app registration."""
+        from deepagents_code.mcp_providers.slack import (
+            _SLACK_LOOPBACK_PORT,
+            SlackProvider,
+        )
+
+        provider = SlackProvider()
+        assert provider.supports_loopback_callback() is True
+        assert provider.loopback_port() == _SLACK_LOOPBACK_PORT
+
     def test_slack_branch_sets_public_client_metadata(self) -> None:
-        """Slack branch configures a public OAuth client (no token secret)."""
+        """Slack branch configures a public OAuth client using the loopback URI."""
         from deepagents_code.mcp_auth import build_oauth_provider
+        from deepagents_code.mcp_providers.slack import _SLACK_REDIRECT_URI
 
         provider = build_oauth_provider(
             server_name="slack",
@@ -341,10 +417,10 @@ class TestBuildOAuthProvider:
         metadata = provider.context.client_metadata
         assert metadata.token_endpoint_auth_method == "none"
         assert metadata.redirect_uris is not None
-        assert [str(uri) for uri in metadata.redirect_uris] == ["https://localhost/"]
+        assert [str(uri) for uri in metadata.redirect_uris] == [_SLACK_REDIRECT_URI]
 
-    def test_generic_branch_uses_localhost_callback(self) -> None:
-        """Non-Slack URLs use the generic `http://localhost/callback` redirect."""
+    def test_generic_branch_uses_loopback_callback(self) -> None:
+        """Non-Slack URLs (including Notion) use a local callback server redirect."""
         from deepagents_code.mcp_auth import build_oauth_provider
 
         provider = build_oauth_provider(
@@ -354,9 +430,8 @@ class TestBuildOAuthProvider:
         )
         metadata = provider.context.client_metadata
         assert metadata.redirect_uris is not None
-        assert [str(uri) for uri in metadata.redirect_uris] == [
-            "http://localhost/callback"
-        ]
+        redirect_uri = str(metadata.redirect_uris[0])
+        assert re.fullmatch(r"http://localhost:\d+/callback", redirect_uri)
         # Generic (non-Slack) providers default to client-secret auth, so the
         # Slack-only `token_endpoint_auth_method="none"` override must not
         # leak into this branch.
@@ -371,6 +446,289 @@ class TestBuildOAuthProvider:
             await redirect("https://auth.example/")
         with pytest.raises(MCPReauthRequiredError):
             await callback()
+
+
+class TestLoopbackHandlers:
+    """Tests for the local OAuth callback server."""
+
+    async def test_loopback_callback_returns_code_and_state(
+        self, monkeypatch: pytest.MonkeyPatch, socket_enabled: object
+    ) -> None:
+        """A browser callback to the loopback URI completes the handler."""
+        import httpx
+
+        from deepagents_code.mcp_auth import build_oauth_provider
+
+        del socket_enabled
+        monkeypatch.setattr("webbrowser.get", lambda *_a, **_kw: object())
+        monkeypatch.setattr("webbrowser.open", lambda _url: True)
+        provider = build_oauth_provider(
+            server_name="notion",
+            server_url="https://mcp.notion.com/mcp",
+            storage=FileTokenStorage("notion"),
+        )
+        metadata = provider.context.client_metadata
+        assert metadata.redirect_uris is not None
+        redirect_uri = str(metadata.redirect_uris[0])
+        redirect_handler = provider.context.redirect_handler
+        callback_handler = provider.context.callback_handler
+        assert redirect_handler is not None
+        assert callback_handler is not None
+
+        await redirect_handler("https://auth.example/authorize")
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{redirect_uri}?code=abc&state=xyz")
+
+        assert response.status_code == 200
+        code, state = await callback_handler()
+        assert code == "abc"
+        assert state == "xyz"
+
+    async def test_loopback_callback_surfaces_provider_error(
+        self, monkeypatch: pytest.MonkeyPatch, socket_enabled: object
+    ) -> None:
+        """Provider-side callback errors propagate with a useful message."""
+        import httpx
+
+        from deepagents_code.mcp_auth import build_oauth_provider
+
+        del socket_enabled
+        monkeypatch.setattr("webbrowser.get", lambda *_a, **_kw: object())
+        monkeypatch.setattr("webbrowser.open", lambda _url: True)
+        provider = build_oauth_provider(
+            server_name="notion",
+            server_url="https://mcp.notion.com/mcp",
+            storage=FileTokenStorage("notion"),
+        )
+        metadata = provider.context.client_metadata
+        assert metadata.redirect_uris is not None
+        redirect_uri = str(metadata.redirect_uris[0])
+        redirect_handler = provider.context.redirect_handler
+        callback_handler = provider.context.callback_handler
+        assert redirect_handler is not None
+        assert callback_handler is not None
+
+        await redirect_handler("https://auth.example/authorize")
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"{redirect_uri}?error=access_denied&error_description=User%20declined"
+            )
+
+        assert response.status_code == 400
+        with pytest.raises(RuntimeError, match="access_denied"):
+            await callback_handler()
+
+    async def test_loopback_callback_missing_code_raises(
+        self, monkeypatch: pytest.MonkeyPatch, socket_enabled: object
+    ) -> None:
+        """A callback URL missing the `code` parameter sends 400 and raises."""
+        import httpx
+
+        from deepagents_code.mcp_auth import build_oauth_provider
+
+        del socket_enabled
+        monkeypatch.setattr("webbrowser.get", lambda *_a, **_kw: object())
+        monkeypatch.setattr("webbrowser.open", lambda _url: True)
+        provider = build_oauth_provider(
+            server_name="notion",
+            server_url="https://mcp.notion.com/mcp",
+            storage=FileTokenStorage("notion"),
+        )
+        metadata = provider.context.client_metadata
+        assert metadata.redirect_uris is not None
+        redirect_uri = str(metadata.redirect_uris[0])
+        redirect_handler = provider.context.redirect_handler
+        callback_handler = provider.context.callback_handler
+        assert redirect_handler is not None
+        assert callback_handler is not None
+
+        await redirect_handler("https://auth.example/authorize")
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{redirect_uri}?state=xyz")
+
+        assert response.status_code == 400
+        with pytest.raises(RuntimeError, match="missing the 'code' parameter"):
+            await callback_handler()
+
+    async def test_loopback_falls_back_when_browser_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the browser cannot open, callback() falls back to paste-back at once."""
+        from deepagents_code.mcp_auth import build_oauth_provider
+
+        monkeypatch.setattr("webbrowser.get", lambda *_a, **_kw: object())
+        monkeypatch.setattr("webbrowser.open", lambda _url: False)
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda _: "https://localhost/?code=fallback&state=s",
+        )
+        provider = build_oauth_provider(
+            server_name="notion",
+            server_url="https://mcp.notion.com/mcp",
+            storage=FileTokenStorage("notion"),
+        )
+        redirect_handler = provider.context.redirect_handler
+        callback_handler = provider.context.callback_handler
+        assert redirect_handler is not None
+        assert callback_handler is not None
+
+        await redirect_handler("https://auth.example/authorize")
+        code, state = await callback_handler()
+        assert code == "fallback"
+        assert state == "s"
+
+    async def test_loopback_falls_back_on_bind_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bind failure in redirect() causes callback() to fall back to paste-back."""
+        from deepagents_code.mcp_auth import (
+            _LoopbackOAuthCallbackServer,
+            build_oauth_provider,
+        )
+
+        monkeypatch.setattr("webbrowser.get", lambda *_a, **_kw: object())
+        monkeypatch.setattr("webbrowser.open", lambda _url: True)
+        monkeypatch.setattr(
+            _LoopbackOAuthCallbackServer,
+            "start",
+            lambda _self: (_ for _ in ()).throw(OSError("Address already in use")),
+        )
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda _: "https://localhost/?code=fallback&state=s",
+        )
+        provider = build_oauth_provider(
+            server_name="notion",
+            server_url="https://mcp.notion.com/mcp",
+            storage=FileTokenStorage("notion"),
+        )
+        redirect_handler = provider.context.redirect_handler
+        callback_handler = provider.context.callback_handler
+        assert redirect_handler is not None
+        assert callback_handler is not None
+
+        await redirect_handler("https://auth.example/authorize")
+        code, state = await callback_handler()
+        assert code == "fallback"
+        assert state == "s"
+
+    async def test_loopback_falls_back_when_webbrowser_get_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No-browser environments (headless, SSH) skip the 300s loopback wait.
+
+        `webbrowser.open` can return `True` in some headless setups even
+        when nothing actually launches. `webbrowser.get` raising
+        `webbrowser.Error` is the reliable signal that no browser is
+        available — the redirect handler must trip the paste-back path
+        without binding a socket or burning the timeout.
+        """
+        import webbrowser
+
+        from deepagents_code.mcp_auth import build_oauth_provider
+
+        def _raise_no_browser(*_a: object, **_kw: object) -> object:
+            no_browser_msg = "no browser"
+            raise webbrowser.Error(no_browser_msg)
+
+        monkeypatch.setattr("webbrowser.get", _raise_no_browser)
+        # Sanity: webbrowser.open intentionally returns True to prove we
+        # never call it when get() fails first.
+        monkeypatch.setattr(
+            "webbrowser.open",
+            lambda _url: pytest.fail("webbrowser.open should not be called"),
+        )
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda _: "https://localhost/?code=fallback&state=s",
+        )
+        provider = build_oauth_provider(
+            server_name="notion",
+            server_url="https://mcp.notion.com/mcp",
+            storage=FileTokenStorage("notion"),
+        )
+        redirect_handler = provider.context.redirect_handler
+        callback_handler = provider.context.callback_handler
+        assert redirect_handler is not None
+        assert callback_handler is not None
+
+        await redirect_handler("https://auth.example/authorize")
+        code, state = await callback_handler()
+        assert code == "fallback"
+        assert state == "s"
+
+    async def test_loopback_falls_back_on_callback_timeout(
+        self, monkeypatch: pytest.MonkeyPatch, socket_enabled: object
+    ) -> None:
+        """A loopback callback that never arrives falls through to paste-back.
+
+        Regression guard for `_LoopbackCallbackTimeoutError`. Without this
+        path, a user whose browser opens but never redirects would hang
+        for the full `_LOOPBACK_CALLBACK_TIMEOUT` (300s).
+        """
+        from deepagents_code.mcp_auth import build_oauth_provider
+
+        del socket_enabled
+        monkeypatch.setattr("deepagents_code.mcp_auth._LOOPBACK_CALLBACK_TIMEOUT", 0.05)
+        monkeypatch.setattr("webbrowser.get", lambda *_a, **_kw: object())
+        monkeypatch.setattr("webbrowser.open", lambda _url: True)
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda _: "https://localhost/?code=after_timeout",
+        )
+        provider = build_oauth_provider(
+            server_name="notion",
+            server_url="https://mcp.notion.com/mcp",
+            storage=FileTokenStorage("notion"),
+        )
+        redirect_handler = provider.context.redirect_handler
+        callback_handler = provider.context.callback_handler
+        assert redirect_handler is not None
+        assert callback_handler is not None
+
+        await redirect_handler("https://auth.example/authorize")
+        code, _state = await callback_handler()
+        assert code == "after_timeout"
+
+    async def test_loopback_repeat_request_after_error_shows_error_page(
+        self, monkeypatch: pytest.MonkeyPatch, socket_enabled: object
+    ) -> None:
+        """A duplicate request after a failed callback must not show success HTML.
+
+        Regression guard: previously `_handle_get` early-returned success
+        whenever the future was done, even if the future resolved with an
+        exception. A second browser hit (prefetch, favicon) would render
+        "You're signed in" while the worker was actually surfacing the
+        underlying error.
+        """
+        import httpx
+
+        from deepagents_code.mcp_auth import build_oauth_provider
+
+        del socket_enabled
+        monkeypatch.setattr("webbrowser.get", lambda *_a, **_kw: object())
+        monkeypatch.setattr("webbrowser.open", lambda _url: True)
+        provider = build_oauth_provider(
+            server_name="notion",
+            server_url="https://mcp.notion.com/mcp",
+            storage=FileTokenStorage("notion"),
+        )
+        metadata = provider.context.client_metadata
+        assert metadata.redirect_uris is not None
+        redirect_uri = str(metadata.redirect_uris[0])
+        redirect_handler = provider.context.redirect_handler
+        assert redirect_handler is not None
+
+        await redirect_handler("https://auth.example/authorize")
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            first = await client.get(f"{redirect_uri}?error=access_denied")
+            second = await client.get(f"{redirect_uri}?code=late")
+
+        assert first.status_code == 400
+        # Second request must surface the prior error state, not success.
+        assert second.status_code == 400
+        assert "You're signed in" not in second.text
+        assert "did not complete" in second.text
 
 
 @pytest.mark.usefixtures("fake_home")
@@ -641,6 +999,8 @@ class TestLogin:
             )
             await storage.set_client_info(_make_client_info())
 
+        from deepagents_code.mcp_oauth_ui import CliOAuthInteraction
+
         with patch("deepagents_code.mcp_auth._drive_handshake", _fake_handshake):
             await login(
                 server_name="notion",
@@ -649,6 +1009,7 @@ class TestLogin:
                     "url": "https://mcp.notion.com/mcp",
                     "auth": "oauth",
                 },
+                ui=CliOAuthInteraction(),
             )
 
         storage = FileTokenStorage(
@@ -662,21 +1023,25 @@ class TestLogin:
     async def test_login_rejects_non_oauth_server(self) -> None:
         """Only `auth: oauth` servers support the login command."""
         from deepagents_code.mcp_auth import login
+        from deepagents_code.mcp_oauth_ui import CliOAuthInteraction
 
         with pytest.raises(ValueError, match="does not use OAuth"):
             await login(
                 server_name="srv",
                 server_config={"transport": "http", "url": "https://example.com"},
+                ui=CliOAuthInteraction(),
             )
 
     async def test_login_rejects_stdio_server(self) -> None:
         """OAuth login is limited to HTTP/SSE transports."""
         from deepagents_code.mcp_auth import login
+        from deepagents_code.mcp_oauth_ui import CliOAuthInteraction
 
         with pytest.raises(ValueError, match="only valid for http/sse"):
             await login(
                 server_name="srv",
                 server_config={"command": "echo", "auth": "oauth"},
+                ui=CliOAuthInteraction(),
             )
 
     async def test_login_propagates_static_headers(
@@ -693,6 +1058,8 @@ class TestLogin:
             await asyncio.sleep(0)
             captured.update(next(iter(connections.values())))
 
+        from deepagents_code.mcp_oauth_ui import CliOAuthInteraction
+
         with patch("deepagents_code.mcp_auth._drive_handshake", _fake_handshake):
             await login(
                 server_name="notion",
@@ -705,6 +1072,7 @@ class TestLogin:
                         "Authorization": "Bearer ${MCP_GATEWAY_TOKEN}",
                     },
                 },
+                ui=CliOAuthInteraction(),
             )
 
         assert captured["headers"] == {
@@ -715,6 +1083,7 @@ class TestLogin:
     async def test_login_unset_env_var_in_headers_raises(self) -> None:
         """Unset env vars in static headers fail before the handshake."""
         from deepagents_code.mcp_auth import login
+        from deepagents_code.mcp_oauth_ui import CliOAuthInteraction
 
         with pytest.raises(RuntimeError, match="unset env var"):
             await login(
@@ -725,6 +1094,7 @@ class TestLogin:
                     "auth": "oauth",
                     "headers": {"Authorization": "Bearer ${MISSING_VAR}"},
                 },
+                ui=CliOAuthInteraction(),
             )
 
     async def test_github_login_runs_device_flow_and_seeds_client(self) -> None:
@@ -740,8 +1110,9 @@ class TestLogin:
             token_url: str,
             client_id: str,
             scope: str | None = None,
+            ui: object | None = None,
         ) -> OAuthToken:
-            del device_code_url, token_url, client_id, scope
+            del device_code_url, token_url, client_id, scope, ui
             return OAuthToken(access_token="gh-tok", token_type="Bearer")
 
         handshake_called = False
@@ -750,6 +1121,8 @@ class TestLogin:
             del connections
             nonlocal handshake_called
             handshake_called = True
+
+        from deepagents_code.mcp_oauth_ui import CliOAuthInteraction
 
         with (
             patch(
@@ -768,6 +1141,7 @@ class TestLogin:
                     "url": "https://api.githubcopilot.com/mcp/",
                     "auth": "oauth",
                 },
+                ui=CliOAuthInteraction(),
             )
 
         assert handshake_called is False, (
@@ -784,11 +1158,57 @@ class TestLogin:
         assert client_info is not None
         assert client_info.client_id == _GITHUB_MCP_CLIENT_ID
 
-    async def test_slack_login_routes_team_into_redirect_url(self) -> None:
+    async def test_slack_login_routes_team_into_redirect_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Slack login threads the entered team id into the interactive URL."""
-        from deepagents_code.mcp_auth import login
+        monkeypatch.setattr("webbrowser.open", lambda _url: False)
 
-        captured_urls: list[str] = []
+        from mcp.shared.auth import OAuthToken
+
+        from deepagents_code.mcp_auth import login
+        from deepagents_code.mcp_oauth_ui import OAuthInteraction
+
+        class _CapturingUI:
+            def __init__(self) -> None:
+                self.authorize_urls: list[tuple[str, bool]] = []
+
+            async def show_authorize_url(
+                self, url: str, *, opened_in_browser: bool
+            ) -> None:
+                self.authorize_urls.append((url, opened_in_browser))
+
+            async def request_callback_url(self) -> str:
+                msg = "not expected in this test"
+                raise AssertionError(msg)
+
+            async def show_device_code(
+                self, *, verification_uri: str, user_code: str, expires_in: int
+            ) -> None: ...
+
+            async def prompt_slack_team_id(self) -> str | None:
+                return "T01234567"
+
+            async def show_success(self, message: str) -> None: ...
+
+            async def show_notice(self, message: str) -> None: ...
+
+            async def show_error(self, message: str) -> None: ...
+
+        # Structural check: all required protocol methods are present.
+        protocol_methods = [
+            "show_authorize_url",
+            "request_callback_url",
+            "show_device_code",
+            "prompt_slack_team_id",
+            "show_success",
+            "show_notice",
+            "show_error",
+        ]
+        ui_instance = _CapturingUI()
+        assert all(callable(getattr(ui_instance, m, None)) for m in protocol_methods)
+
+        ui = _CapturingUI()
 
         async def _fake_handshake(connections: dict) -> None:
             server_name, connection = next(iter(connections.items()))
@@ -796,29 +1216,9 @@ class TestLogin:
             redirect = provider.context.redirect_handler
             await redirect("https://slack.com/oauth/v2/authorize?client_id=x")
             storage = FileTokenStorage(server_name, server_url=connection["url"])
-            from mcp.shared.auth import OAuthToken
-
             await storage.set_tokens(OAuthToken(access_token="t", token_type="Bearer"))
 
-        async def _fake_prompt_team() -> str | None:
-            return "T01234567"
-
-        with (
-            patch(
-                "deepagents_code.mcp_providers.slack._prompt_slack_team",
-                _fake_prompt_team,
-            ),
-            patch(
-                "deepagents_code.mcp_auth._drive_handshake",
-                _fake_handshake,
-            ),
-            patch(
-                "builtins.print",
-                lambda *args, **_kwargs: captured_urls.extend(
-                    s for s in args if isinstance(s, str)
-                ),
-            ),
-        ):
+        with patch("deepagents_code.mcp_auth._drive_handshake", _fake_handshake):
             await login(
                 server_name="slack",
                 server_config={
@@ -826,10 +1226,12 @@ class TestLogin:
                     "url": "https://slack.com/mcp",
                     "auth": "oauth",
                 },
+                ui=ui,
             )
 
-        joined = "\n".join(captured_urls)
-        assert "team=T01234567" in joined
+        assert ui.authorize_urls, "authorize URL must be shown"
+        shown_url, _opened = ui.authorize_urls[0]
+        assert "team=T01234567" in shown_url
 
     async def test_slack_preseed_is_idempotent(self) -> None:
         """Preseeding Slack client info a second time reads rather than writes."""

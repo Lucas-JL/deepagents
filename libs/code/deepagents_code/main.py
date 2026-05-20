@@ -830,6 +830,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=positive_int,
+        metavar="SECONDS",
+        help="Hard wall-clock timeout in seconds. The agent is cancelled and "
+        "the process exits with code 124 if the timeout is reached. "
+        "Complements --max-turns (turn count) with a time-based limit; both "
+        "use exit code 124 on expiry. Requires -n or piped stdin.",
+    )
+
+    parser.add_argument(
         "--stdin",
         action="store_true",
         help="Read input from stdin explicitly (instead of auto-detection)",
@@ -1165,7 +1176,11 @@ async def _run_acp_cli_async(
     """
     from deepagents_code.agent import create_cli_agent, load_async_subagents
     from deepagents_code.config import create_model, settings
-    from deepagents_code.model_config import ModelConfigError, save_recent_model
+    from deepagents_code.model_config import (
+        ModelConfigError,
+        save_recent_model,
+        touch_recent_model,
+    )
     from deepagents_code.tools import fetch_url, web_search
 
     try:
@@ -1181,7 +1196,9 @@ async def _run_acp_cli_async(
     model_result.apply_to_settings()
 
     # Persist the resolved model so [models].recent is always populated.
-    save_recent_model(f"{model_result.provider}:{model_result.model_name}")
+    resolved_spec = f"{model_result.provider}:{model_result.model_name}"
+    save_recent_model(resolved_spec)
+    touch_recent_model(resolved_spec)
 
     tools: list[Any] = [fetch_url]
     if settings.has_tavily:
@@ -1264,7 +1281,7 @@ def apply_stdin_pipe(args: argparse.Namespace) -> None:
         piped text to it (the CLI still runs non-interactively):
 
         ```bash
-        cat context.txt | deepagents -n "summarize this"
+        cat context.txt | dcode -n "summarize this"
         # non_interactive_message = "{contents of context.txt}\n\nsummarize this"
         ```
 
@@ -1272,7 +1289,7 @@ def apply_stdin_pipe(args: argparse.Namespace) -> None:
         the piped text to it (the CLI still runs interactively):
 
         ```bash
-        cat error.log | deepagents -m "explain this"
+        cat error.log | dcode -m "explain this"
         # initial_prompt = "{contents of error.log}\n\nexplain this"
         ```
 
@@ -1281,7 +1298,7 @@ def apply_stdin_pipe(args: argparse.Namespace) -> None:
         startup request:
 
         ```bash
-        cat diff.txt | deepagents --skill code-review
+        cat diff.txt | dcode --skill code-review
         # initial_prompt = "{contents of diff.txt}"
         ```
 
@@ -1289,7 +1306,7 @@ def apply_stdin_pipe(args: argparse.Namespace) -> None:
         the CLI to run non-interactively with it as the prompt:
 
         ```bash
-        echo "fix the typo in README.md" | deepagents
+        echo "fix the typo in README.md" | dcode
         # non_interactive_message = "fix the typo in README.md"
         ```
 
@@ -1325,7 +1342,7 @@ def apply_stdin_pipe(args: argparse.Namespace) -> None:
             console.print(
                 "[bold red]Error:[/bold red] --stdin was passed but stdin "
                 "is a terminal. Pipe input or use -n instead.\n"
-                "  cat prompt.txt | deepagents --stdin -q"
+                "  cat prompt.txt | dcode --stdin -q"
             )
             sys.exit(1)
         return
@@ -1521,7 +1538,7 @@ def _check_mcp_project_trust(*, trust_flag: bool = False) -> bool | None:
     from rich.console import Console as _Console
 
     docs_url = (
-        "https://docs.langchain.com/oss/python/deepagents/cli/"
+        "https://docs.langchain.com/oss/python/deepagents/code/"
         "mcp-tools#project-level-trust"
     )
     prompt_console = _Console(stderr=True)
@@ -1676,8 +1693,8 @@ def cli_main() -> None:
                 msg = (
                     "Error: --no-mcp and --mcp-config are mutually exclusive."
                     " Use one or the other.\n"
-                    "  deepagents --mcp-config path/to/config.json\n"
-                    "  deepagents --no-mcp\n"
+                    "  dcode --mcp-config path/to/config.json\n"
+                    "  dcode --no-mcp\n"
                 )
                 sys.stderr.write(msg)
                 sys.stderr.flush()
@@ -1712,8 +1729,8 @@ def cli_main() -> None:
             _Console(stderr=True).print(
                 "[bold red]Error:[/bold red] --no-mcp and --mcp-config "
                 "are mutually exclusive. Use one or the other.\n"
-                "  deepagents --mcp-config path/to/config.json\n"
-                "  deepagents --no-mcp"
+                "  dcode --mcp-config path/to/config.json\n"
+                "  dcode --no-mcp"
             )
             sys.exit(2)
 
@@ -1728,8 +1745,8 @@ def cli_main() -> None:
                 "[bold red]Error:[/bold red] --skill requires "
                 "--non-interactive (-n) when combined with --quiet or "
                 "--no-stream.\n"
-                "  deepagents --skill code-review -m 'review this patch'\n"
-                "  deepagents --skill code-review -n 'review this patch'"
+                "  dcode --skill code-review -m 'review this patch'\n"
+                "  dcode --skill code-review -n 'review this patch'"
             )
             sys.exit(2)
 
@@ -1740,7 +1757,18 @@ def cli_main() -> None:
             _Console(stderr=True).print(
                 "[bold red]Error:[/bold red] --max-turns requires "
                 "--non-interactive (-n) or piped stdin\n"
-                "  deepagents -n 'refactor auth module' --max-turns 5"
+                "  dcode -n 'refactor auth module' --max-turns 5"
+            )
+            sys.exit(2)
+
+        timeout_set = getattr(args, "timeout", None) is not None
+        if timeout_set and not args.non_interactive_message:
+            from rich.console import Console as _Console
+
+            _Console(stderr=True).print(
+                "[bold red]Error:[/bold red] --timeout requires "
+                "--non-interactive (-n) or piped stdin\n"
+                "  dcode -n 'run the test suite' --timeout 120"
             )
             sys.exit(2)
 
@@ -1759,7 +1787,7 @@ def cli_main() -> None:
             _Console(stderr=True).print(
                 f"[bold red]Error:[/bold red] {flag} requires "
                 "--non-interactive (-n) or piped stdin\n"
-                "  deepagents -n 'summarize README.md' --quiet"
+                "  dcode -n 'summarize README.md' --quiet"
             )
             sys.exit(2)
 
@@ -1964,7 +1992,7 @@ def cli_main() -> None:
                 if getattr(args, "mcp_config", None) and not args.config_path:
                     print(  # noqa: T201
                         "--mcp-config is not supported for 'mcp login'. "
-                        "Use: deepagents mcp login <server> --config <path>",
+                        "Use: dcode mcp login <server> --config <path>",
                         file=sys.stderr,
                     )
                     sys.exit(2)
@@ -2066,26 +2094,49 @@ def cli_main() -> None:
             # Non-interactive mode - execute single task and exit
             from deepagents_code.non_interactive import run_non_interactive
 
-            exit_code = asyncio.run(
-                run_non_interactive(
-                    message=args.non_interactive_message,
-                    assistant_id=assistant_id,
-                    model_name=getattr(args, "model", None),
-                    model_params=model_params,
-                    profile_override=profile_override,
-                    sandbox_type=args.sandbox,
-                    sandbox_id=args.sandbox_id,
-                    sandbox_setup=getattr(args, "sandbox_setup", None),
-                    initial_skill=getattr(args, "initial_skill", None),
-                    startup_cmd=getattr(args, "startup_cmd", None),
-                    quiet=args.quiet,
-                    stream=not args.no_stream,
-                    mcp_config_path=getattr(args, "mcp_config", None),
-                    no_mcp=getattr(args, "no_mcp", False),
-                    trust_project_mcp=getattr(args, "trust_project_mcp", False),
-                    max_turns=getattr(args, "max_turns", None),
+            timeout = getattr(args, "timeout", None)
+            try:
+                exit_code = asyncio.run(
+                    asyncio.wait_for(
+                        run_non_interactive(
+                            message=args.non_interactive_message,
+                            assistant_id=assistant_id,
+                            model_name=getattr(args, "model", None),
+                            model_params=model_params,
+                            profile_override=profile_override,
+                            sandbox_type=args.sandbox,
+                            sandbox_id=args.sandbox_id,
+                            sandbox_setup=getattr(args, "sandbox_setup", None),
+                            initial_skill=getattr(args, "initial_skill", None),
+                            startup_cmd=getattr(args, "startup_cmd", None),
+                            quiet=args.quiet,
+                            stream=not args.no_stream,
+                            mcp_config_path=getattr(args, "mcp_config", None),
+                            no_mcp=getattr(args, "no_mcp", False),
+                            trust_project_mcp=getattr(args, "trust_project_mcp", False),
+                            max_turns=getattr(args, "max_turns", None),
+                        ),
+                        timeout=timeout,
+                    )
                 )
-            )
+            except TimeoutError:
+                # `asyncio.wait_for` raises `asyncio.TimeoutError`, which is
+                # an alias of the builtin on Python >= 3.11 (the project's
+                # minimum).
+                from rich.console import Console as _Console
+
+                _Console(stderr=True).print(
+                    f"[bold red]Error:[/bold red] agent timed out after "
+                    f"{timeout}s. Retry with a larger --timeout, or use "
+                    "--max-turns for a turn-count limit."
+                )
+                sys.exit(124)
+            except KeyboardInterrupt:
+                # `asyncio.run` re-raises `KeyboardInterrupt` past the inner
+                # `run_non_interactive` handler when the signal hits during
+                # `wait_for`; mirror its exit code 130 here so Ctrl-C is a
+                # quiet exit instead of a traceback.
+                sys.exit(130)
             sys.exit(exit_code)
         else:
             # Resolve recent-agent fallback only for actual session launches.
@@ -2187,7 +2238,7 @@ def cli_main() -> None:
             if thread_id and return_code == 0 and asyncio.run(thread_exists(thread_id)):
                 console.print()
                 console.print("[dim]Resume this thread with:[/dim]")
-                hint = Text("deepagents -r ", style="cyan")
+                hint = Text("dcode -r ", style="cyan")
                 hint.append(str(thread_id), style="cyan")
                 console.print(hint)
 
@@ -2222,7 +2273,7 @@ def cli_main() -> None:
                         console.print(cmd_hint)
                         if not is_auto_update_enabled():
                             auto_hint = Text("Enable auto-updates: ", style="dim")
-                            auto_hint.append("deepagents --auto-update", style="cyan")
+                            auto_hint.append("dcode --auto-update", style="cyan")
                             console.print(auto_hint)
                         mark_update_notified(latest)
             except Exception:
