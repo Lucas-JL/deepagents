@@ -29,6 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+oss = ["oss2>=2.18.0"]
 quickjs = ["langchain-quickjs"]
 
 [project.urls]
